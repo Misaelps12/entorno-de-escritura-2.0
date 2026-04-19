@@ -9,7 +9,8 @@ import PantallaInicio from "./componente/PantallaInicio.jsx";
 
 // Importamos funciones de Tauri
 import { save, open } from '@tauri-apps/plugin-dialog';
-import { writeTextFile, readTextFile } from '@tauri-apps/plugin-fs';
+import { writeTextFile, readTextFile, readDir, exists, mkdir } from '@tauri-apps/plugin-fs';
+import { appDataDir } from '@tauri-apps/api/path';
 
 import './App.css'
 
@@ -17,6 +18,9 @@ import './App.css'
 import { TextStyleKit } from '@tiptap/extension-text-style'
 import { Highlight } from '@tiptap/extension-highlight'
 import { Color } from '@tiptap/extension-color'
+
+import { useEffect } from 'react';
+
 
 function App() {
   const [vistaActiva, setVistaActiva] = useState('inicio');
@@ -42,17 +46,102 @@ function App() {
     },
   });
 
+  // --- FUNCIONES DE PERSISTENCIA EN DISCO ---
+
+  // Obtener la carpeta de datos de la app
+  const obtenerCarpetaLibros = async () => {
+    try {
+      const dataDir = await appDataDir();
+      const librosDir = `${dataDir}libros`;
+      
+      // Crear carpeta si no existe
+      if (!(await exists(librosDir))) {
+        await mkdir(librosDir, { recursive: true });
+      }
+      
+      return librosDir;
+    } catch (err) {
+      console.error('Error al obtener carpeta:', err);
+      return null;
+    }
+  };
+
+  // Guardar un libro individual a disco
+  const guardarLibroADisco = async (libro) => {
+    try {
+      const librosDir = await obtenerCarpetaLibros();
+      if (!librosDir) return false;
+
+      const nombreArchivo = `${librosDir}/${libro.id}-${libro.titulo.replace(/\s+/g, '_')}.json`;
+      const datosLibro = {
+        id: libro.id,
+        titulo: libro.titulo,
+        contenido: libro.contenido,
+        fechaActualizacion: new Date().toISOString(),
+      };
+
+      await writeTextFile(nombreArchivo, JSON.stringify(datosLibro, null, 2));
+      console.log(`✓ Libro guardado: ${libro.titulo}`);
+      return true;
+    } catch (err) {
+      console.error('Error al guardar libro:', err);
+      return false;
+    }
+  };
+
+  // Cargar todos los libros desde disco
+  const cargarLibrosDelDisco = async () => {
+    try {
+      const librosDir = await obtenerCarpetaLibros();
+      if (!librosDir) return null;
+
+      if (!(await exists(librosDir))) {
+        console.log('Carpeta de libros no existe, usando valores por defecto');
+        return null;
+      }
+
+      const archivos = await readDir(librosDir);
+      const librosEnDisco = [];
+
+      for (const archivo of archivos) {
+        if (archivo.name.endsWith('.json')) {
+          try {
+            const contenido = await readTextFile(`${librosDir}/${archivo.name}`);
+            const libro = JSON.parse(contenido);
+            librosEnDisco.push(libro);
+          } catch (err) {
+            console.error(`Error al leer ${archivo.name}:`, err);
+          }
+        }
+      }
+
+      // Si encontramos libros, los retornamos; si no, retornamos null para usar los por defecto
+      return librosEnDisco.length > 0 ? librosEnDisco : null;
+    } catch (err) {
+      console.error('Error al cargar libros:', err);
+      return null;
+    }
+  };
+
   // --- LÓGICA DE ENTORNOS SEPARADOS ---
 
   const guardarLibroActualEnEstado = () => {
     if (libroActivoId === null || !editor) return;
 
     const contenidoActual = editor.getHTML();
-    setLibros((librosPrevios) =>
-      librosPrevios.map((libro) =>
+    setLibros((librosPrevios) => {
+      const librosActualizados = librosPrevios.map((libro) =>
         libro.id === libroActivoId ? { ...libro, contenido: contenidoActual } : libro
-      )
-    );
+      );
+
+      // Guardar en disco
+      const libroActualizado = librosActualizados.find((l) => l.id === libroActivoId);
+      if (libroActualizado) {
+        guardarLibroADisco(libroActualizado);
+      }
+
+      return librosActualizados;
+    });
   };
 
   const abrirEntorno = (idLibro) => {
@@ -72,10 +161,37 @@ function App() {
   };
 
   const cerrarEntorno = () => {
-    guardarLibroActualEnEstado();
+    // Guardamos el contenido actual antes de volver
+    if (libroActivoId !== null) {
+      guardarLibroActualEnEstado();
+    }
+    
+    // Volvemos a la pantalla de inicio
     setLibroActivoId(null);
     setVistaActiva('inicio');
   };
+
+  // Cargar libros al iniciar la aplicación
+  useEffect(() => {
+    const cargarLibros = async () => {
+      const librosDelDisco = await cargarLibrosDelDisco();
+      if (librosDelDisco && librosDelDisco.length > 0) {
+        setLibros(librosDelDisco);
+      } else {
+        // Si no hay libros en disco, guardar los por defecto
+        const librosDefault = [
+          { id: 1, titulo: 'Los 6 Guardianes', contenido: '<h1>Los 6 Guardianes</h1><p>Había una vez...</p>' },
+          { id: 2, titulo: 'Borrador de Ideas', contenido: '<h1>Borrador de Ideas</h1><p>Comienza a escribir aquí...</p>' },
+        ];
+        
+        for (const libro of librosDefault) {
+          await guardarLibroADisco(libro);
+        }
+      }
+    };
+
+    cargarLibros();
+  }, []);
 
   const manejarApertura = async () => {
     if (!editor) return;
@@ -95,12 +211,18 @@ function App() {
 
   const manejarGuardado = async () => {
     if (!editor) return;
+
+    // 1. Guardar en el estado de la app (libros)
+    guardarLibroActualEnEstado();
+
+    // 2. Opcionalmente, permitir guardar como archivo externo
     try {
       const path = await save({
         filters: [{ name: 'Documento HTML', extensions: ['html'] }]
       });
       if (path) {
         await writeTextFile(path, editor.getHTML());
+        console.log('✓ Archivo exportado:', path);
       }
     } catch (err) {
       console.error("Error al guardar:", err);
